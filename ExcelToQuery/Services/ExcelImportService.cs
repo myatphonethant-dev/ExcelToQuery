@@ -38,7 +38,9 @@ namespace ExcelToQuery.Services
                 if (string.IsNullOrWhiteSpace(targetDatabase))
                     throw new ArgumentException("Target database is required");
 
-                _logger.LogInformation($"Starting import: File={file.FileName}, Table={tableName}, Database={targetDatabase}");
+                _logger.LogInformation($"=== Starting Import ===");
+                _logger.LogInformation($"File: {file.FileName}, Size: {file.Length} bytes");
+                _logger.LogInformation($"Table: {tableName}, Database: {targetDatabase}");
 
                 // Read file into memory
                 using var stream = new MemoryStream();
@@ -52,13 +54,15 @@ namespace ExcelToQuery.Services
                 if (worksheet.Dimension == null)
                     throw new Exception("Excel file is empty or invalid");
 
-                // Extract data from Excel
+                _logger.LogInformation($"Excel worksheet: {worksheet.Name}, Dimensions: {worksheet.Dimension.Address}");
+
+                // Extract data from Excel (always assume has headers)
                 var (data, headers) = ExtractDataFromWorksheet(worksheet, true);
 
                 if (!data.Any())
                     throw new Exception("No data found in Excel file");
 
-                _logger.LogInformation($"Found {data.Count} rows, {headers.Count} columns");
+                _logger.LogInformation($"Extracted {data.Count} rows, {headers.Count} columns");
 
                 // Import to database
                 var recordsImported = await ImportToDatabase(
@@ -66,13 +70,16 @@ namespace ExcelToQuery.Services
                     tableName,
                     data);
 
-                _logger.LogInformation($"Import completed in {(DateTime.Now - startTime).TotalSeconds:F2} seconds");
+                var elapsed = (DateTime.Now - startTime).TotalSeconds;
+                _logger.LogInformation($"=== Import Completed ===");
+                _logger.LogInformation($"Records imported: {recordsImported}");
+                _logger.LogInformation($"Time taken: {elapsed:F2} seconds");
 
                 return recordsImported;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"Error importing Excel file: {ex.Message}");
+                _logger.LogError(ex, $"!!! Import Failed !!!");
                 throw;
             }
         }
@@ -165,52 +172,122 @@ namespace ExcelToQuery.Services
         }
 
         private async Task<int> ImportToDatabase(
-    string database,
-    string tableName,
-    List<Dictionary<string, object>> data)
+            string database,
+            string tableName,
+            List<Dictionary<string, object>> data)
         {
             if (!data.Any())
                 throw new Exception("No data to import");
 
-            _logger.LogInformation($"Starting database import to {database}.{tableName} with {data.Count} rows");
-
             var connectionString = GetConnectionString(database);
-            _logger.LogDebug($"Connection string: {MaskPassword(connectionString)}");
+            _logger.LogInformation($"Using connection string: {MaskPassword(connectionString)}");
 
             using var connection = new SqlConnection(connectionString);
 
             try
             {
-                _logger.LogInformation("Opening database connection...");
                 await connection.OpenAsync();
-                _logger.LogInformation("Database connection opened successfully");
+                _logger.LogInformation($"Connected to database: {database}");
 
                 // Check if table exists before inserting
                 await CheckIfTableExists(connection, tableName);
 
                 // Get column names from first row
                 var columns = data[0].Keys.ToList();
-                _logger.LogInformation($"Inserting data with columns: {string.Join(", ", columns)}");
 
-                // Insert data
+                // Insert data (NO TRUNCATE)
                 var recordsImported = await BulkInsertData(
                     connection,
                     tableName,
                     columns,
                     data);
 
-                _logger.LogInformation($"Successfully imported {recordsImported} records to {tableName}");
                 return recordsImported;
-            }
-            catch (SqlException sqlEx)
-            {
-                _logger.LogError(sqlEx, $"SQL error importing to database {database}, table {tableName}: {sqlEx.Message}");
-                throw new Exception($"SQL Server error: {sqlEx.Message}", sqlEx);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, $"Error importing to database {database}, table {tableName}");
                 throw new Exception($"Database import failed: {ex.Message}", ex);
+            }
+        }
+
+        private async Task<int> BulkInsertData(
+            SqlConnection connection,
+            string tableName,
+            List<string> columns,
+            List<Dictionary<string, object>> data)
+        {
+            var recordsImported = 0;
+
+            // Build parameterized INSERT statement
+            var columnNames = string.Join(", ", columns.Select(c => $"[{c}]"));
+            var paramNames = string.Join(", ", columns.Select(c => $"@{c}"));
+
+            var insertQuery = $@"
+        INSERT INTO [{tableName}] ({columnNames})
+        VALUES ({paramNames})";
+
+            // Create transaction
+            using var transaction = await connection.BeginTransactionAsync() as SqlTransaction;
+
+            try
+            {
+                using var command = new SqlCommand(insertQuery, connection, transaction);
+
+                // Add parameters
+                foreach (var column in columns)
+                {
+                    command.Parameters.Add($"@{column}", SqlDbType.NVarChar);
+                }
+
+                // Insert rows
+                for (int i = 0; i < data.Count; i++)
+                {
+                    try
+                    {
+                        var row = data[i];
+
+                        // Set parameter values
+                        foreach (var column in columns)
+                        {
+                            var param = command.Parameters[$"@{column}"];
+                            var value = row.ContainsKey(column) ? row[column] : DBNull.Value;
+
+                            if (value == DBNull.Value || value == null)
+                            {
+                                param.Value = DBNull.Value;
+                            }
+                            else
+                            {
+                                param.Value = value;
+                                param.SqlDbType = GetSqlDbType(value);
+                            }
+                        }
+
+                        await command.ExecuteNonQueryAsync();
+                        recordsImported++;
+
+                        if ((i + 1) % 100 == 0)
+                        {
+                            _logger.LogInformation($"Inserted {i + 1} rows to {tableName}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning($"Error inserting row {i + 1}: {ex.Message}");
+                        // Continue with next row
+                    }
+                }
+
+                await transaction.CommitAsync();
+                _logger.LogInformation($"Transaction committed. Total inserted: {recordsImported}");
+                return recordsImported;
+            }
+            catch (Exception ex)
+            {
+                await transaction.RollbackAsync();
+                _logger.LogError(ex, $"Transaction rolled back due to error");
+                throw;
             }
         }
 
@@ -242,86 +319,6 @@ namespace ExcelToQuery.Services
             }
         }
 
-        private async Task<int> BulkInsertData(
-            SqlConnection connection,
-            string tableName,
-            List<string> columns,
-            List<Dictionary<string, object>> data)
-        {
-            var recordsImported = 0;
-
-            // Build parameterized INSERT statement
-            var columnNames = string.Join(", ", columns.Select(c => $"[{c}]"));
-            var paramNames = string.Join(", ", columns.Select(c => $"@{c}"));
-
-            var insertQuery = $@"
-                INSERT INTO [{tableName}] ({columnNames})
-                VALUES ({paramNames})";
-
-            // Create transaction for batch insert
-            using var transaction = await connection.BeginTransactionAsync() as SqlTransaction;
-
-            try
-            {
-                using var command = new SqlCommand(insertQuery, connection, transaction);
-
-                // Add parameters
-                foreach (var column in columns)
-                {
-                    command.Parameters.Add($"@{column}", SqlDbType.NVarChar);
-                }
-
-                // Insert rows
-                for (int i = 0; i < data.Count; i++)
-                {
-                    try
-                    {
-                        var row = data[i];
-
-                        // Set parameter values
-                        foreach (var column in columns)
-                        {
-                            var param = command.Parameters[$"@{column}"];
-                            var value = row.ContainsKey(column) ? row[column] : DBNull.Value;
-
-                            // Set appropriate value and type
-                            if (value == DBNull.Value || value == null)
-                            {
-                                param.Value = DBNull.Value;
-                            }
-                            else
-                            {
-                                param.Value = value;
-                                param.SqlDbType = GetSqlDbType(value);
-                            }
-                        }
-
-                        await command.ExecuteNonQueryAsync();
-                        recordsImported++;
-
-                        // Log progress every 100 rows
-                        if ((i + 1) % 100 == 0)
-                        {
-                            _logger.LogInformation($"Inserted {i + 1} rows to {tableName}");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning($"Error inserting row {i + 1}: {ex.Message}");
-                        // Continue with next row
-                    }
-                }
-
-                await transaction.CommitAsync();
-                return recordsImported;
-            }
-            catch (Exception)
-            {
-                await transaction.RollbackAsync();
-                throw;
-            }
-        }
-
         private SqlDbType GetSqlDbType(object value)
         {
             return value switch
@@ -338,22 +335,47 @@ namespace ExcelToQuery.Services
             };
         }
 
-        private string GetConnectionString(string database)
+        private string GetConnectionStringV1(string database)
         {
             // Try to get connection string from configuration
             var connectionString = _configuration.GetConnectionString(database);
 
             if (!string.IsNullOrEmpty(connectionString))
             {
-                _logger.LogInformation($"Using connection string for database: {database}");
                 return connectionString;
             }
 
-            // Log available connection strings for debugging
-            var allConnections = _configuration.GetSection("ConnectionStrings").GetChildren();
-            _logger.LogWarning($"Database '{database}' not found in connection strings. Available: {string.Join(", ", allConnections.Select(c => c.Key))}");
+            // Fallback to default connection
+            connectionString = _configuration.GetConnectionString("DefaultConnection");
 
-            throw new Exception($"Connection string not found for database: {database}. Available databases: {string.Join(", ", allConnections.Select(c => c.Key))}");
+            if (!string.IsNullOrEmpty(connectionString))
+            {
+                return connectionString;
+            }
+
+            // If still not found, throw detailed error
+            var allConnections = _configuration.GetSection("ConnectionStrings").GetChildren();
+            var availableConnections = string.Join(", ", allConnections.Select(c => c.Key));
+
+            throw new Exception($"Connection string not found for '{database}'. Available connections: {availableConnections}");
+        }
+
+        private string GetConnectionString(string database)
+        {
+            // Temporary hardcoded connection string for testing
+            string connectionString;
+
+            if (database.Equals("gtb_wallet_log", StringComparison.OrdinalIgnoreCase))
+            {
+                connectionString = "Server=.;Database=gtb_wallet_log;User ID=sa;Password=sasa@123;TrustServerCertificate=true;";
+            }
+            else
+            {
+                connectionString = "Server=.;Database=gtb_wallet;User ID=sa;Password=sasa@123;TrustServerCertificate=true;";
+            }
+
+            _logger.LogInformation($"Using connection string for {database}: {MaskPassword(connectionString)}");
+            return connectionString;
         }
     }
 }

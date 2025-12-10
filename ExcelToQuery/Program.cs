@@ -1,9 +1,30 @@
 ﻿using ExcelToQuery;
 using ExcelToQuery.Services;
+using Microsoft.Data.SqlClient;
 using Microsoft.OpenApi.Models;
 using System.Reflection;
 
 var builder = WebApplication.CreateBuilder(args);
+
+var testConnectionString = "Server=.;Database=gtb_wallet;User ID=sa;Password=sasa@123;TrustServerCertificate=True;";
+
+try
+{
+    using var testConn = new SqlConnection(testConnectionString);
+    await testConn.OpenAsync();
+    Console.WriteLine("✅ SQL Server connection SUCCESS!");
+
+    // Test query
+    using var cmd = new SqlCommand("SELECT @@VERSION", testConn);
+    var version = await cmd.ExecuteScalarAsync();
+    Console.WriteLine($"SQL Server Version: {version}");
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"❌ SQL Server connection FAILED: {ex.Message}");
+    // Don't continue if SQL Server isn't accessible
+    throw;
+}
 
 // Add services to the container.
 builder.Services.AddControllers();
