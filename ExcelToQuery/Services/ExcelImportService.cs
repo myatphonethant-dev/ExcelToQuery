@@ -16,7 +16,6 @@ namespace ExcelToQuery.Services
 
         public ExcelImportService(IConfiguration configuration, ILogger<ExcelImportService> logger)
         {
-            _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             ExcelPackage.LicenseContext = LicenseContext.NonCommercial;
         }
@@ -189,23 +188,27 @@ namespace ExcelToQuery.Services
 
             try
             {
-                _logger.LogInformation("Opening connection...");
                 await connection.OpenAsync();
-                _logger.LogInformation($"Connection opened. State: {connection.State}");
 
-                // Check if table exists
-                if (!await TableExists(connection, tableName))
-                {
-                    throw new Exception($"Table '{tableName}' does not exist in database '{database}'");
-                }
+                // Check if table exists before inserting
+                await CheckIfTableExists(connection, tableName);
 
-                // Insert data
-                return await SimpleBulkInsert(connection, tableName, data);
+                // Get column names from first row
+                var columns = data[0].Keys.ToList();
+
+                // Insert data (NO TRUNCATE)
+                var recordsImported = await BulkInsertData(
+                    connection,
+                    tableName,
+                    columns,
+                    data);
+
+                return recordsImported;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"Database import error");
-                throw new Exception($"Failed to import to database: {ex.Message}", ex);
+                _logger.LogError(ex, $"Error importing to database {database}, table {tableName}");
+                throw new Exception($"Database import failed: {ex.Message}", ex);
             }
         }
 
@@ -236,56 +239,131 @@ namespace ExcelToQuery.Services
             }
         }
 
-        private async Task<int> SimpleBulkInsert(
-            SqlConnection connection,
-            string tableName,
-            List<Dictionary<string, object>> data)
+        private async Task<int> BulkInsertData(
+    SqlConnection connection,
+    string tableName,
+    List<string> columns,
+    List<Dictionary<string, object>> data)
         {
-            if (!data.Any()) return 0;
+            var recordsImported = 0;
 
-            var columns = data[0].Keys.ToList();
+            // Build parameterized INSERT statement
             var columnNames = string.Join(", ", columns.Select(c => $"[{c}]"));
             var paramNames = string.Join(", ", columns.Select(c => $"@{c}"));
 
-            var query = $"INSERT INTO [{tableName}] ({columnNames}) VALUES ({paramNames})";
+            var insertQuery = $@"
+        INSERT INTO [{tableName}] ({columnNames})
+        VALUES ({paramNames})";
 
-            _logger.LogInformation($"Insert query: {query}");
-
-            using var transaction = await connection.BeginTransactionAsync();
-            var recordsImported = 0;
+            // ✅ FIX: Create transaction AFTER connection is open
+            using var transaction = await connection.BeginTransactionAsync() as SqlTransaction;
 
             try
             {
+                using var command = new SqlCommand(insertQuery, connection, transaction);
+
+                // Add parameters
+                foreach (var column in columns)
+                {
+                    command.Parameters.Add($"@{column}", SqlDbType.NVarChar);
+                }
+
+                // Insert rows
                 for (int i = 0; i < data.Count; i++)
                 {
-                    using var cmd = new SqlCommand(query, connection, (SqlTransaction)transaction);
-
-                    // Add parameters
-                    foreach (var column in columns)
+                    try
                     {
-                        cmd.Parameters.AddWithValue($"@{column}", data[i][column] ?? DBNull.Value);
+                        var row = data[i];
+
+                        // Set parameter values
+                        foreach (var column in columns)
+                        {
+                            var param = command.Parameters[$"@{column}"];
+                            var value = row.ContainsKey(column) ? row[column] : DBNull.Value;
+
+                            if (value == DBNull.Value || value == null)
+                            {
+                                param.Value = DBNull.Value;
+                            }
+                            else
+                            {
+                                param.Value = value;
+                                param.SqlDbType = GetSqlDbType(value);
+                            }
+                        }
+
+                        await command.ExecuteNonQueryAsync();
+                        recordsImported++;
+
+                        if ((i + 1) % 100 == 0)
+                        {
+                            _logger.LogInformation($"Inserted {i + 1} rows to {tableName}");
+                        }
                     }
-
-                    await cmd.ExecuteNonQueryAsync();
-                    recordsImported++;
-
-                    if ((i + 1) % 100 == 0)
+                    catch (Exception ex)
                     {
-                        _logger.LogInformation($"Inserted {i + 1} rows...");
+                        _logger.LogWarning($"Error inserting row {i + 1}: {ex.Message}");
+                        // Continue with next row
                     }
                 }
 
                 await transaction.CommitAsync();
-                _logger.LogInformation($"Committed transaction. Total: {recordsImported} rows");
-
                 return recordsImported;
             }
             catch (Exception ex)
             {
                 await transaction.RollbackAsync();
-                _logger.LogError(ex, $"Insert failed at row {recordsImported + 1}");
+                _logger.LogError(ex, $"Transaction rolled back");
                 throw;
             }
+        }
+
+        private async Task CheckIfTableExists(SqlConnection connection, string tableName)
+        {
+            try
+            {
+                var query = @"
+            SELECT COUNT(*) 
+            FROM INFORMATION_SCHEMA.TABLES 
+            WHERE TABLE_NAME = @TableName";
+
+                using var command = new SqlCommand(query, connection);
+                command.Parameters.AddWithValue("@TableName", tableName);
+
+                var tableExists = (int)await command.ExecuteScalarAsync() > 0;
+
+                if (!tableExists)
+                {
+                    throw new Exception($"Table '{tableName}' does not exist in the database. Please create it first.");
+                }
+
+                _logger.LogInformation($"Table '{tableName}' exists");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error checking if table exists: {tableName}");
+                throw;
+            }
+        }
+
+        private SqlDbType GetSqlDbType(object value)
+        {
+            if (value == null || value == DBNull.Value)
+                return SqlDbType.NVarChar;
+
+            return value switch
+            {
+                int => SqlDbType.Int,
+                long => SqlDbType.BigInt,
+                decimal => SqlDbType.Decimal,
+                float => SqlDbType.Float,
+                double => SqlDbType.Float,
+                DateTime => SqlDbType.DateTime,
+                bool => SqlDbType.Bit,
+                Guid => SqlDbType.UniqueIdentifier,
+                byte[] => SqlDbType.VarBinary,
+                _ => SqlDbType.NVarChar
+            };
         }
 
         // Helper method to mask password in logs
