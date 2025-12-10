@@ -8,12 +8,8 @@ namespace ExcelToQuery.Services
 {
     public interface IExcelImportService
     {
-        Task<FileUploadResponseModel> ImportExcelFile(FileUploadRequest request);
-        Task<FileAutoDetectModel> AutoDetectFileInfo(IFormFile file);
-        Task<List<DatabaseInfoModel>> GetAvailableDatabases();
-        Task<List<TableSchemaModel>> GetTablesInDatabase(string database);
+        Task<int> ImportExcel(IFormFile file, string tableName, string targetDatabase);
         Task<TableSchemaModel> GetTableSchema(string database, string schema, string tableName);
-        Task<BulkUploadResponseModel> BulkImport(BulkUploadRequestModel request);
     }
 
     public class ExcelImportService : IExcelImportService
@@ -53,145 +49,64 @@ namespace ExcelToQuery.Services
 
         #region File Import Methods
 
-        public async Task<FileUploadResponseModel> ImportExcelFile(FileUploadRequest request)
+        public async Task<int> ImportExcel(IFormFile file, string tableName, string targetDatabase)
         {
-            var response = new FileUploadResponseModel
-            {
-                ImportTimestamp = DateTime.UtcNow,
-                ImportedFileName = request.File?.FileName
-            };
-
             var startTime = DateTime.Now;
 
             try
             {
-                // Validate file
-                if (request.File == null || request.File.Length == 0)
-                {
-                    response.Success = false;
-                    response.Message = "No file uploaded";
-                    return response;
-                }
+                // Validate inputs
+                if (file == null || file.Length == 0)
+                    throw new ArgumentException("No file uploaded");
+
+                if (string.IsNullOrWhiteSpace(tableName))
+                    throw new ArgumentException("Table name is required");
+
+                if (string.IsNullOrWhiteSpace(targetDatabase))
+                    throw new ArgumentException("Target database is required");
+
+                _logger.LogInformation($"Starting import: File={file.FileName}, Table={tableName}, Database={targetDatabase}");
 
                 // Read file into memory
                 using var stream = new MemoryStream();
-                await request.File.CopyToAsync(stream);
+                await file.CopyToAsync(stream);
                 stream.Position = 0;
-
-                // Auto-detect database and table if not specified
-                if (string.IsNullOrEmpty(request.TargetDatabase))
-                {
-                    request.TargetDatabase = DetectDatabaseFromFilename(request.File.FileName);
-                    _logger.LogInformation($"Auto-detected database: {request.TargetDatabase} for file: {request.File.FileName}");
-                }
-
-                if (string.IsNullOrEmpty(request.TableName))
-                {
-                    request.TableName = DetectTableNameFromFilename(request.File.FileName);
-                    _logger.LogInformation($"Auto-detected table: {request.TableName} for file: {request.File.FileName}");
-                }
-
-                response.TargetDatabase = request.TargetDatabase;
-                response.TargetTable = request.TableName;
 
                 // Parse Excel file
                 using var package = new ExcelPackage(stream);
-                var worksheet = GetWorksheet(package, request.SheetName);
+                var worksheet = package.Workbook.Worksheets[0]; // Always use first sheet
 
-                if (worksheet == null)
-                {
-                    response.Success = false;
-                    response.Message = $"Worksheet '{request.SheetName}' not found";
-                    return response;
-                }
+                if (worksheet.Dimension == null)
+                    throw new Exception("Excel file is empty or invalid");
 
-                // Extract data from Excel
-                var (data, headers) = ExtractDataFromWorksheet(worksheet, request.HasHeaders);
-                response.TotalRecords = data.Count;
+                // Extract data from Excel (always assume has headers)
+                var (data, headers) = ExtractDataFromWorksheet(worksheet, true);
+                var totalRecords = data.Count;
 
-                // Apply column mappings if provided
-                if (request.ColumnMappings.Any())
-                {
-                    data = ApplyColumnMappings(data, headers, request.ColumnMappings);
-                }
+                if (!data.Any())
+                    throw new Exception("No data found in Excel file");
 
-                // Import to database
-                var importResult = await ImportToDatabase(
-                    request.TargetDatabase,
-                    request.TableName,
+                // Import to database (always truncate table)
+                var recordsImported = await ImportToDatabase(
+                    targetDatabase,
+                    tableName,
                     data,
-                    request.TruncateTable);
+                    truncateTable: true);
 
-                response.RecordsImported = importResult.RecordsImported;
-                response.RecordsSkipped = response.TotalRecords - importResult.RecordsImported;
-                response.Success = importResult.Success;
-                response.Message = importResult.Message;
-                response.Errors = importResult.Errors;
+                _logger.LogInformation($"Import completed: {recordsImported}/{totalRecords} records imported to {tableName}");
+
+                return recordsImported;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error importing Excel file");
-                response.Success = false;
-                response.Message = $"Import failed: {ex.Message}";
-                response.Errors.Add(ex.Message);
+                _logger.LogError(ex, $"Error importing Excel file: {ex.Message}");
+                throw;
             }
-
-            response.ProcessingTime = DateTime.Now - startTime;
-            return response;
         }
 
         #endregion
 
         #region Helper Methods
-
-        private string DetectDatabaseFromFilename(string filename)
-        {
-            var fileName = Path.GetFileNameWithoutExtension(filename);
-
-            foreach (var mapping in _databaseMapping)
-            {
-                if (fileName.Contains(mapping.Key, StringComparison.OrdinalIgnoreCase))
-                {
-                    return mapping.Value;
-                }
-            }
-
-            // Default to gtb_wallet
-            return "gtb_wallet";
-        }
-
-        private string DetectTableNameFromFilename(string filename)
-        {
-            var fileName = Path.GetFileNameWithoutExtension(filename);
-
-            // Remove date patterns (e.g., 4.12.25, 2025-12-04, etc.)
-            var cleanedName = Regex.Replace(fileName, @"[\d\.\-]+", "").Trim();
-
-            foreach (var mapping in _tableMapping)
-            {
-                if (cleanedName.Contains(mapping.Key, StringComparison.OrdinalIgnoreCase))
-                {
-                    return mapping.Value;
-                }
-            }
-
-            // If no mapping found, try to construct a reasonable table name
-            if (cleanedName.EndsWith("Log", StringComparison.OrdinalIgnoreCase))
-            {
-                return $"Tbl_{cleanedName}";
-            }
-
-            return $"Tbl_{cleanedName}";
-        }
-
-        private ExcelWorksheet GetWorksheet(ExcelPackage package, string sheetName)
-        {
-            if (!string.IsNullOrEmpty(sheetName))
-            {
-                return package.Workbook.Worksheets[sheetName] ?? package.Workbook.Worksheets[0];
-            }
-            return package.Workbook.Worksheets[0];
-        }
 
         private (List<Dictionary<string, object>> data, List<string> headers)
             ExtractDataFromWorksheet(ExcelWorksheet worksheet, bool hasHeaders)
@@ -283,104 +198,19 @@ namespace ExcelToQuery.Services
             return sanitized;
         }
 
-        private List<Dictionary<string, object>> ApplyColumnMappings(
-            List<Dictionary<string, object>> data,
-            List<string> originalHeaders,
-            List<ColumnMapping> mappings)
-        {
-            var result = new List<Dictionary<string, object>>();
-
-            foreach (var row in data)
-            {
-                var newRow = new Dictionary<string, object>();
-
-                foreach (var mapping in mappings)
-                {
-                    object value = DBNull.Value;
-
-                    // Find the source column (case-insensitive)
-                    var sourceHeader = originalHeaders.FirstOrDefault(h =>
-                        h.Equals(mapping.SourceColumn, StringComparison.OrdinalIgnoreCase));
-
-                    if (sourceHeader != null && row.TryGetValue(sourceHeader, out var rawValue))
-                    {
-                        try
-                        {
-                            value = ConvertToDataType(rawValue, mapping.DataType);
-                        }
-                        catch
-                        {
-                            // Use default value if conversion fails
-                            if (!string.IsNullOrEmpty(mapping.DefaultValue))
-                                value = ConvertToDataType(mapping.DefaultValue, mapping.DataType);
-                        }
-                    }
-                    else if (!string.IsNullOrEmpty(mapping.DefaultValue))
-                    {
-                        value = ConvertToDataType(mapping.DefaultValue, mapping.DataType);
-                    }
-
-                    newRow[mapping.TargetColumn] = value;
-                }
-
-                result.Add(newRow);
-            }
-
-            return result;
-        }
-
-        private object ConvertToDataType(object value, string dataType)
-        {
-            if (value == null || value == DBNull.Value)
-                return DBNull.Value;
-
-            if (value is string str && string.IsNullOrWhiteSpace(str))
-                return DBNull.Value;
-
-            try
-            {
-                var type = dataType.ToLower();
-                var stringValue = value.ToString();
-
-                return type switch
-                {
-                    "int" or "integer" => Convert.ToInt32(value),
-                    "bigint" => Convert.ToInt64(value),
-                    "decimal" or "numeric" or "money" => Convert.ToDecimal(value),
-                    "float" => Convert.ToSingle(value),
-                    "double" => Convert.ToDouble(value),
-                    "datetime" or "date" => Convert.ToDateTime(value),
-                    "datetime2" => Convert.ToDateTime(value),
-                    "smalldatetime" => Convert.ToDateTime(value),
-                    "bit" or "bool" or "boolean" => Convert.ToBoolean(value),
-                    "uniqueidentifier" or "guid" => Guid.Parse(stringValue),
-                    "char" or "nchar" or "varchar" or "nvarchar" or "text" => stringValue,
-                    _ => stringValue
-                };
-            }
-            catch
-            {
-                // Return as string if conversion fails
-                return value.ToString();
-            }
-        }
-
         #endregion
 
         #region Database Operations
 
-        private async Task<FileUploadResponseModel> ImportToDatabase(
+        private async Task<int> ImportToDatabase(
             string database,
             string tableName,
             List<Dictionary<string, object>> data,
             bool truncateTable)
         {
-            var response = new FileUploadResponseModel();
-
             if (!data.Any())
             {
-                response.Message = "No data to import";
-                return response;
+                throw new Exception("No data to import");
             }
 
             var connectionString = GetConnectionString(database);
@@ -402,8 +232,8 @@ namespace ExcelToQuery.Services
                     // Get column names from first row
                     var columns = data[0].Keys.ToList();
 
-                    // Build INSERT statement
-                    var insertResult = await BulkInsertData(
+                    // Insert data
+                    var recordsImported = await BulkInsertData(
                         connection,
                         transaction,
                         tableName,
@@ -412,26 +242,19 @@ namespace ExcelToQuery.Services
 
                     await transaction.CommitAsync();
 
-                    response.Success = true;
-                    response.RecordsImported = insertResult.RecordsImported;
-                    response.Message = $"Successfully imported {insertResult.RecordsImported} records";
-                    response.Errors = insertResult.Errors;
+                    return recordsImported;
                 }
                 catch (Exception ex)
                 {
                     await transaction.RollbackAsync();
-                    throw;
+                    throw new Exception($"Transaction failed: {ex.Message}", ex);
                 }
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, $"Error importing to database {database}, table {tableName}");
-                response.Success = false;
-                response.Message = $"Database import failed: {ex.Message}";
-                response.Errors.Add(ex.Message);
+                throw new Exception($"Database import failed: {ex.Message}", ex);
             }
-
-            return response;
         }
 
         private async Task TruncateTable(SqlConnection connection, SqlTransaction transaction, string tableName)
@@ -456,7 +279,7 @@ namespace ExcelToQuery.Services
             }
         }
 
-        private async Task<(int RecordsImported, List<string> Errors)> BulkInsertData(
+        private async Task<int> BulkInsertData(
             SqlConnection connection,
             SqlTransaction transaction,
             string tableName,
@@ -464,15 +287,14 @@ namespace ExcelToQuery.Services
             List<Dictionary<string, object>> data)
         {
             var recordsImported = 0;
-            var errors = new List<string>();
 
             // Build parameterized INSERT statement
             var columnNames = string.Join(", ", columns.Select(c => $"[{c}]"));
             var paramNames = string.Join(", ", columns.Select(c => $"@{c}"));
 
             var insertQuery = $@"
-                INSERT INTO [{tableName}] ({columnNames})
-                VALUES ({paramNames})";
+        INSERT INTO [{tableName}] ({columnNames})
+        VALUES ({paramNames})";
 
             using var command = new SqlCommand(insertQuery, connection, transaction);
 
@@ -518,13 +340,12 @@ namespace ExcelToQuery.Services
                 }
                 catch (Exception ex)
                 {
-                    var errorMsg = $"Row {i + 1}: {ex.Message}";
-                    errors.Add(errorMsg);
-                    _logger.LogWarning(ex, $"Error importing row {i + 1}");
+                    _logger.LogWarning($"Error importing row {i + 1}: {ex.Message}");
+                    // Continue with next row instead of throwing
                 }
             }
 
-            return (recordsImported, errors);
+            return recordsImported;
         }
 
         private SqlDbType GetSqlDbType(object value)
@@ -558,137 +379,6 @@ namespace ExcelToQuery.Services
         #endregion
 
         #region Other Service Methods
-
-        public async Task<FileAutoDetectModel> AutoDetectFileInfo(IFormFile file)
-        {
-            var result = new FileAutoDetectModel
-            {
-                FileName = file.FileName,
-                SuggestedDatabase = DetectDatabaseFromFilename(file.FileName),
-                SuggestedTableName = DetectTableNameFromFilename(file.FileName)
-            };
-
-            try
-            {
-                using var stream = new MemoryStream();
-                await file.CopyToAsync(stream);
-                stream.Position = 0;
-
-                using var package = new ExcelPackage(stream);
-                var worksheet = package.Workbook.Worksheets[0];
-
-                if (worksheet.Dimension != null)
-                {
-                    result.RowCount = worksheet.Dimension.Rows;
-                    result.ColumnCount = worksheet.Dimension.Columns;
-                    result.SheetName = worksheet.Name;
-
-                    // Read first few rows to detect columns
-                    for (int col = 1; col <= Math.Min(result.ColumnCount, 10); col++)
-                    {
-                        var header = worksheet.Cells[1, col].Text?.Trim();
-                        if (!string.IsNullOrEmpty(header))
-                        {
-                            var column = new DetectedColumn
-                            {
-                                Name = header,
-                                SampleValue = worksheet.Cells[2, col].Text,
-                                MaxLength = Math.Max(header?.Length ?? 0, worksheet.Cells[2, col].Text?.Length ?? 0)
-                            };
-
-                            // Try to detect data type from sample value
-                            if (DateTime.TryParse(column.SampleValue, out _))
-                                column.DataType = "datetime";
-                            else if (decimal.TryParse(column.SampleValue, out _))
-                                column.DataType = "decimal";
-                            else if (int.TryParse(column.SampleValue, out _))
-                                column.DataType = "int";
-                            else if (bool.TryParse(column.SampleValue, out _))
-                                column.DataType = "bool";
-
-                            result.DetectedColumns.Add(column);
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error auto-detecting file info");
-            }
-
-            return result;
-        }
-
-        public async Task<List<DatabaseInfoModel>> GetAvailableDatabases()
-        {
-            return new List<DatabaseInfoModel>
-            {
-                new DatabaseInfoModel
-                {
-                    Name = "gtb_wallet",
-                    DisplayName = "GTB Wallet",
-                    ConnectionStringKey = "gtb_wallet",
-                    IsDefault = true,
-                    LastConnected = DateTime.UtcNow
-                },
-                new DatabaseInfoModel
-                {
-                    Name = "gtb_wallet_log",
-                    DisplayName = "GTB Wallet Log",
-                    ConnectionStringKey = "gtb_wallet_log",
-                    IsDefault = false,
-                    LastConnected = DateTime.UtcNow
-                }
-            };
-        }
-
-        public async Task<List<TableSchemaModel>> GetTablesInDatabase(string database)
-        {
-            var tables = new List<TableSchemaModel>();
-
-            try
-            {
-                var connectionString = GetConnectionString(database);
-                using var connection = new SqlConnection(connectionString);
-                await connection.OpenAsync();
-
-                var query = @"
-                    SELECT 
-                        s.name as SchemaName,
-                        t.name as TableName,
-                        t.create_date as CreatedDate,
-                        t.modify_date as ModifiedDate,
-                        p.rows as RowCount
-                    FROM sys.tables t
-                    INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-                    LEFT JOIN sys.partitions p ON t.object_id = p.object_id
-                    WHERE p.index_id IN (0, 1)
-                    ORDER BY s.name, t.name";
-
-                using var command = new SqlCommand(query, connection);
-                using var reader = await command.ExecuteReaderAsync();
-
-                while (await reader.ReadAsync())
-                {
-                    tables.Add(new TableSchemaModel
-                    {
-                        Database = database,
-                        Schema = reader["SchemaName"].ToString(),
-                        TableName = reader["TableName"].ToString(),
-                        CreatedDate = reader["CreatedDate"] as DateTime?,
-                        ModifiedDate = reader["ModifiedDate"] as DateTime?,
-                        RowCount = reader["RowCount"] as long?
-                    });
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, $"Error getting tables from database {database}");
-                throw;
-            }
-
-            return tables;
-        }
 
         public async Task<TableSchemaModel> GetTableSchema(string database, string schema, string tableName)
         {
@@ -784,80 +474,6 @@ namespace ExcelToQuery.Services
             }
 
             return tableSchema;
-        }
-
-        public async Task<BulkUploadResponseModel> BulkImport(BulkUploadRequestModel request)
-        {
-            var response = new BulkUploadResponseModel
-            {
-                TotalFiles = request.Files.Count,
-                ProcessedAt = DateTime.UtcNow
-            };
-
-            var tasks = new List<Task<FileUploadResponseModel>>();
-
-            foreach (var file in request.Files)
-            {
-                var fileRequest = new FileUploadRequest
-                {
-                    File = file,
-                    TargetDatabase = request.DefaultDatabase
-                };
-
-                if (request.ProcessInParallel)
-                {
-                    tasks.Add(Task.Run(() => ImportExcelFile(fileRequest)));
-                }
-                else
-                {
-                    var result = await ImportExcelFile(fileRequest);
-                    UpdateBulkResponse(response, file.FileName, result, request.StopOnFirstError);
-
-                    if (request.StopOnFirstError && !result.Success)
-                        break;
-                }
-            }
-
-            if (request.ProcessInParallel)
-            {
-                var results = await Task.WhenAll(tasks);
-                foreach (var result in results)
-                {
-                    var fileName = result.ImportedFileName;
-                    UpdateBulkResponse(response, fileName, result, request.StopOnFirstError);
-                }
-            }
-
-            response.OverallSuccess = response.FailedFiles == 0;
-            response.SuccessfulFiles = response.TotalFiles - response.FailedFiles;
-
-            return response;
-        }
-
-        private void UpdateBulkResponse(
-            BulkUploadResponseModel response,
-            string fileName,
-            FileUploadResponseModel result,
-            bool stopOnFirstError)
-        {
-            var fileResult = new FileResult
-            {
-                FileName = fileName,
-                Success = result.Success,
-                Database = result.TargetDatabase,
-                TableName = result.TargetTable,
-                RecordsImported = result.RecordsImported,
-                ErrorMessage = result.Success ? null : result.Message,
-                ProcessingTime = result.ProcessingTime
-            };
-
-            response.FileResults.Add(fileResult);
-            response.TotalRecordsImported += result.RecordsImported;
-
-            if (!result.Success)
-            {
-                response.FailedFiles++;
-            }
         }
 
         #endregion

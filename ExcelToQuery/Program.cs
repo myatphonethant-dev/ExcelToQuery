@@ -1,16 +1,23 @@
+using ExcelToQuery;
 using ExcelToQuery.Services;
 using Microsoft.OpenApi.Models;
-using Swashbuckle.AspNetCore.SwaggerGen;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // Add services to the container
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen(c =>
+builder.Services.AddSwaggerGen(options =>
 {
-    c.SwaggerDoc("v1", new OpenApiInfo { Title = "Data Import API", Version = "v1" });
-    c.OperationFilter<SwaggerFileUploadOperation>();
+    options.SwaggerDoc("v1", new OpenApiInfo
+    {
+        Title = "Excel to Query API",
+        Version = "v1",
+        Description = "API for uploading Excel files to database tables"
+    });
+
+    // Add support for file upload in Swagger
+    options.OperationFilter<SwaggerFileUploadFilter>();
 });
 
 // Add CORS
@@ -42,30 +49,3 @@ app.UseAuthorization();
 app.MapControllers();
 
 app.Run();
-
-// Swagger file upload operation filter
-public class SwaggerFileUploadOperation : IOperationFilter
-{
-    public void Apply(OpenApiOperation operation, OperationFilterContext context)
-    {
-        var fileParams = context.MethodInfo.GetParameters()
-            .Where(p => p.ParameterType == typeof(IFormFile));
-
-        if (fileParams.Any())
-        {
-            operation.Parameters.Clear();
-            operation.Parameters.Add(new OpenApiParameter
-            {
-                Name = "file",
-                In = ParameterLocation.Header,
-                Description = "Upload file",
-                Required = true,
-                Schema = new OpenApiSchema
-                {
-                    Type = "string",
-                    Format = "binary"
-                }
-            });
-        }
-    }
-}

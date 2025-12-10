@@ -198,3 +198,10 @@
         public bool SkipInvalidRows { get; set; } = false;
     }
 }
+
+public class SimpleImportRequest
+{
+    public IFormFile File { get; set; }
+    public string TableName { get; set; }
+    public string TargetDatabase { get; set; }
+}
