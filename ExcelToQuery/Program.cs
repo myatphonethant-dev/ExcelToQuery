@@ -1,14 +1,35 @@
+﻿using ExcelToQuery;
 using ExcelToQuery.Services;
-// ... other using statements
+using Microsoft.OpenApi.Models;
+using System.Reflection;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // Add services to the container.
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen();
+builder.Services.AddSwaggerGen(options =>
+{
+    options.SwaggerDoc("v1", new OpenApiInfo
+    {
+        Title = "Excel to Query API",
+        Version = "v1",
+        Description = "API for uploading Excel files to SQL Server databases"
+    });
 
-// ? ADD THIS LINE - Register your service
+    // Add file upload support
+    options.OperationFilter<SwaggerFileOperationFilter>();
+
+    // Enable XML comments
+    var xmlFile = $"{Assembly.GetExecutingAssembly().GetName().Name}.xml";
+    var xmlPath = Path.Combine(AppContext.BaseDirectory, xmlFile);
+    if (File.Exists(xmlPath))
+    {
+        options.IncludeXmlComments(xmlPath);
+    }
+});
+
+// ✅ Register your service
 builder.Services.AddScoped<IExcelImportService, ExcelImportService>();
 
 var app = builder.Build();

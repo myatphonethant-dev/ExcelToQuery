@@ -52,7 +52,7 @@ namespace ExcelToQuery.Services
                 if (worksheet.Dimension == null)
                     throw new Exception("Excel file is empty or invalid");
 
-                // Extract data from Excel (always assume has headers)
+                // Extract data from Excel
                 var (data, headers) = ExtractDataFromWorksheet(worksheet, true);
 
                 if (!data.Any())
@@ -60,13 +60,13 @@ namespace ExcelToQuery.Services
 
                 _logger.LogInformation($"Found {data.Count} rows, {headers.Count} columns");
 
-                // Import to database (ONLY INSERT, NO TRUNCATE)
+                // Import to database
                 var recordsImported = await ImportToDatabase(
                     targetDatabase,
                     tableName,
                     data);
 
-                _logger.LogInformation($"Import completed: {recordsImported}/{data.Count} records inserted to {tableName}");
+                _logger.LogInformation($"Import completed in {(DateTime.Now - startTime).TotalSeconds:F2} seconds");
 
                 return recordsImported;
             }
@@ -165,40 +165,63 @@ namespace ExcelToQuery.Services
         }
 
         private async Task<int> ImportToDatabase(
-            string database,
-            string tableName,
-            List<Dictionary<string, object>> data)
+    string database,
+    string tableName,
+    List<Dictionary<string, object>> data)
         {
             if (!data.Any())
                 throw new Exception("No data to import");
 
+            _logger.LogInformation($"Starting database import to {database}.{tableName} with {data.Count} rows");
+
             var connectionString = GetConnectionString(database);
+            _logger.LogDebug($"Connection string: {MaskPassword(connectionString)}");
+
             using var connection = new SqlConnection(connectionString);
 
             try
             {
+                _logger.LogInformation("Opening database connection...");
                 await connection.OpenAsync();
+                _logger.LogInformation("Database connection opened successfully");
 
                 // Check if table exists before inserting
                 await CheckIfTableExists(connection, tableName);
 
                 // Get column names from first row
                 var columns = data[0].Keys.ToList();
+                _logger.LogInformation($"Inserting data with columns: {string.Join(", ", columns)}");
 
-                // Insert data (NO TRUNCATE)
+                // Insert data
                 var recordsImported = await BulkInsertData(
                     connection,
                     tableName,
                     columns,
                     data);
 
+                _logger.LogInformation($"Successfully imported {recordsImported} records to {tableName}");
                 return recordsImported;
+            }
+            catch (SqlException sqlEx)
+            {
+                _logger.LogError(sqlEx, $"SQL error importing to database {database}, table {tableName}: {sqlEx.Message}");
+                throw new Exception($"SQL Server error: {sqlEx.Message}", sqlEx);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, $"Error importing to database {database}, table {tableName}");
                 throw new Exception($"Database import failed: {ex.Message}", ex);
             }
+        }
+
+        // Helper method to mask password in logs
+        private string MaskPassword(string connectionString)
+        {
+            if (string.IsNullOrEmpty(connectionString))
+                return connectionString;
+
+            var regex = new Regex(@"Password=([^;]+)", RegexOptions.IgnoreCase);
+            return regex.Replace(connectionString, "Password=***");
         }
 
         private async Task CheckIfTableExists(SqlConnection connection, string tableName)
@@ -317,20 +340,20 @@ namespace ExcelToQuery.Services
 
         private string GetConnectionString(string database)
         {
+            // Try to get connection string from configuration
             var connectionString = _configuration.GetConnectionString(database);
 
-            if (string.IsNullOrEmpty(connectionString))
+            if (!string.IsNullOrEmpty(connectionString))
             {
-                // Fallback to default connection string
-                connectionString = _configuration.GetConnectionString("DefaultConnection");
-
-                if (string.IsNullOrEmpty(connectionString))
-                {
-                    throw new Exception($"Connection string not found for database: {database}");
-                }
+                _logger.LogInformation($"Using connection string for database: {database}");
+                return connectionString;
             }
 
-            return connectionString;
+            // Log available connection strings for debugging
+            var allConnections = _configuration.GetSection("ConnectionStrings").GetChildren();
+            _logger.LogWarning($"Database '{database}' not found in connection strings. Available: {string.Join(", ", allConnections.Select(c => c.Key))}");
+
+            throw new Exception($"Connection string not found for database: {database}. Available databases: {string.Join(", ", allConnections.Select(c => c.Key))}");
         }
     }
 }

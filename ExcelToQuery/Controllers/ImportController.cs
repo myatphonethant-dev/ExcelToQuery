@@ -7,18 +7,19 @@ namespace ExcelToQuery.Controllers
     [Route("api/[controller]")]
     public class ImportController : ControllerBase
     {
-        private readonly ExcelImportService _excelImportService;
+        private readonly IExcelImportService _excelImportService;
 
-        public ImportController(ExcelImportService excelImportService)
+        public ImportController(IExcelImportService excelImportService)
         {
             _excelImportService = excelImportService;
         }
 
         [HttpPost("upload")]
+        [Consumes("multipart/form-data")] // ✅ Add this attribute
         public async Task<IActionResult> ImportExcel(
-        [FromForm] IFormFile file,
-        [FromForm] string tableName,
-        [FromForm] string targetDatabase)
+            [FromForm] IFormFile file,
+            [FromForm] string tableName,
+            [FromForm] string targetDatabase)
         {
             try
             {

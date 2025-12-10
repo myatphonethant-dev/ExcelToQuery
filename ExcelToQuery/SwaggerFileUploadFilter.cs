@@ -1,51 +1,52 @@
 ﻿using Microsoft.OpenApi.Models;
 using Swashbuckle.AspNetCore.SwaggerGen;
 
-namespace ExcelToQuery;
-
-public class SwaggerFileUploadFilter : IOperationFilter
+namespace ExcelToQuery
 {
-    public void Apply(OpenApiOperation operation, OperationFilterContext context)
+    public class SwaggerFileOperationFilter : IOperationFilter
     {
-        var method = context.MethodInfo;
-
-        if (method.Name == "ImportExcel")
+        public void Apply(OpenApiOperation operation, OperationFilterContext context)
         {
-            operation.Parameters.Clear();
+            var method = context.MethodInfo;
 
-            operation.RequestBody = new OpenApiRequestBody
+            if (method.Name == "ImportExcel" && context.ApiDescription.HttpMethod == "POST")
             {
-                Content = new Dictionary<string, OpenApiMediaType>
+                operation.Parameters.Clear();
+
+                operation.RequestBody = new OpenApiRequestBody
                 {
-                    ["multipart/form-data"] = new OpenApiMediaType
+                    Content = new Dictionary<string, OpenApiMediaType>
                     {
-                        Schema = new OpenApiSchema
+                        ["multipart/form-data"] = new OpenApiMediaType
                         {
-                            Type = "object",
-                            Properties = new Dictionary<string, OpenApiSchema>
+                            Schema = new OpenApiSchema
                             {
-                                ["file"] = new OpenApiSchema
+                                Type = "object",
+                                Properties = new Dictionary<string, OpenApiSchema>
                                 {
-                                    Type = "string",
-                                    Format = "binary",
-                                    Description = "Excel file to upload"
+                                    ["file"] = new OpenApiSchema
+                                    {
+                                        Type = "string",
+                                        Format = "binary",
+                                        Description = "Excel file to upload"
+                                    },
+                                    ["tableName"] = new OpenApiSchema
+                                    {
+                                        Type = "string",
+                                        Description = "Target table name"
+                                    },
+                                    ["targetDatabase"] = new OpenApiSchema
+                                    {
+                                        Type = "string",
+                                        Description = "Target database name"
+                                    }
                                 },
-                                ["tableName"] = new OpenApiSchema
-                                {
-                                    Type = "string",
-                                    Description = "Target table name"
-                                },
-                                ["targetDatabase"] = new OpenApiSchema
-                                {
-                                    Type = "string",
-                                    Description = "Target database name"
-                                }
-                            },
-                            Required = new HashSet<string> { "file", "tableName", "targetDatabase" }
+                                Required = new HashSet<string> { "file", "tableName", "targetDatabase" }
+                            }
                         }
                     }
-                }
-            };
+                };
+            }
         }
     }
 }
